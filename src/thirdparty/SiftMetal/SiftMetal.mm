@@ -21,7 +21,13 @@
 #include <string>
 #include <vector>
 
-// Path to compiled metallib is set by CMake and embedded here.
+#include <mach-o/dyld.h>
+#include <stdlib.h>
+#include <sys/syslimits.h>
+
+// Path to compiled metallib is set by CMake and embedded here. Used as a
+// fallback when running from a build tree where the metallib hasn't been
+// copied next to the executable.
 #ifndef SIFT_METAL_METALLIB_PATH
 #define SIFT_METAL_METALLIB_PATH ""
 #endif
@@ -233,19 +239,50 @@ bool SiftMetalExtractorImpl::Init(const Options& opts, int max_w, int max_h) {
   if (!commandQueue_) return false;
 
   // Load the pre-compiled metal library.
+  // Resolution order:
+  //  1. Sibling of the running executable (e.g. .app/Contents/Resources/sift.metallib).
+  //     Required when colmap is launched as a subprocess of a sandboxed/TCC-restricted
+  //     parent — files inside the executable's own bundle are always readable, files
+  //     outside (such as the build dir) are not.
+  //  2. SIFT_METAL_METALLIB_PATH (compile-time absolute build-dir path). Useful for
+  //     development runs straight from the build tree.
+  // We deliberately do NOT fall back to newDefaultLibrary, because in this app the
+  // executable's bundle may already contain a different default.metallib (for msplat),
+  // and silently loading the wrong library masks the real failure with cryptic
+  // "Failed to find function" errors for every SIFT kernel.
   NSError* error = nil;
-  NSString* libPath =
-      [NSString stringWithUTF8String:SIFT_METAL_METALLIB_PATH];
+  NSString* libPath = nil;
+  {
+    char exeBuf[PATH_MAX];
+    uint32_t exeBufSize = sizeof(exeBuf);
+    if (_NSGetExecutablePath(exeBuf, &exeBufSize) == 0) {
+      char resolvedBuf[PATH_MAX];
+      if (realpath(exeBuf, resolvedBuf) != nullptr) {
+        NSString* exePath = [NSString stringWithUTF8String:resolvedBuf];
+        NSString* sibling = [[exePath stringByDeletingLastPathComponent]
+            stringByAppendingPathComponent:@"sift.metallib"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:sibling]) {
+          libPath = sibling;
+        }
+      }
+    }
+  }
+  if (!libPath) {
+    NSString* embedded =
+        [NSString stringWithUTF8String:SIFT_METAL_METALLIB_PATH];
+    if (embedded.length > 0 &&
+        [[NSFileManager defaultManager] fileExistsAtPath:embedded]) {
+      libPath = embedded;
+    }
+  }
   if (libPath.length > 0) {
     NSURL* libURL = [NSURL fileURLWithPath:libPath];
     library_ = [device_ newLibraryWithURL:libURL error:&error];
   }
   if (!library_) {
-    // Fallback: try default library.
-    library_ = [device_ newDefaultLibrary];
-  }
-  if (!library_) {
-    NSLog(@"SiftMetal: Failed to load Metal library: %@", error);
+    NSLog(@"SiftMetal: Failed to load Metal library (tried %@): %@",
+          libPath ?: @"<no metallib found next to executable or at build path>",
+          error);
     return false;
   }
 
